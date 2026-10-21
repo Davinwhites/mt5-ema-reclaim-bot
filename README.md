@@ -3,159 +3,120 @@
 Real-market Python service that:
 
 - Connects to a running **MetaTrader 5** terminal via the official `MetaTrader5` package
-- Runs the exact **EMA-Reclaim v1** strategy from the simulation (EMA 20/50 + ATR filters)
-- Calculates position size from risk %, sets SL/TP from ATR multiples
-- Places market orders (or dry-runs them) with a unique magic number
-- Is designed to run 24/7 on a cheap VPS
+- Runs the exact **EMA-Reclaim v1** strategy (EMA 20/50 + ATR filters) on **gold**
+- Opens a market order when a closed bar signals, and closes it the moment price trades through the stop or the target
+- Sizes the position from risk %, with the broker's minimum lot used only when it is still close to that risk
+- Is meant to run 24/7 on a Windows VPS next to the MT5 terminal
 
 ---
 
-## Strategy summary (identical to the TypeScript simulation)
+## Strategy summary
 
 | Rule | Detail |
 |------|--------|
+| Instrument | Gold. `SYMBOL=XAUUSD`, with broker suffixes tried automatically (`XAUUSDm`, `GOLD`, `XAUUSD.m`, …) |
 | Indicators | EMA(20), EMA(50), ATR(14) |
 | Min history | 60 closed candles |
 | Filter | EMA separation ≥ 0.12 × ATR |
 | Filter | Last bar range ≤ 3.2 × ATR (spike filter) |
 | BUY | Fast > Slow, close > Slow, previous close ≤ prev Fast, close > Fast, bullish candle |
 | SELL | Fast < Slow, close < Slow, previous close ≥ prev Fast, close < Fast, bearish candle |
-| Stop | 1.5 × ATR |
+| Stop | 1.5 × ATR, widened only if the broker stop level is further |
 | Take | 2.2 × ATR |
 | Risk | 0.25 % of equity per trade (configurable) |
-| Limits | Max 1 position, daily loss 1 %, max DD 3 %, max spread filter |
+| Limits | Max 1 position, daily loss 1 %, max DD 3 %, gold spread cap |
 
-Signals are evaluated **only on closed bars**.
+Signals are evaluated **only on closed bars**. Exits are checked on every poll (default 1 second) against the price the close would actually fill: bid for a buy, ask for a sell.
+
+---
+
+## What makes the order actually go through
+
+Gold brokers reject the old forex defaults. The bot now handles that:
+
+- **Spread.** A 2-pip forex cap blocks every XAU quote. Gold defaults to 50 pips (about 0.50 of price). A configured cap of 5 or below is lifted automatically on gold.
+- **Filling mode.** The symbol's advertised mode is tried first, then `RETURN`, which is what most gold CFDs accept. A `10030` invalid-fill answer tries the next mode instead of dropping the signal.
+- **Stops.** If the broker stop level is wider than 1.5 × ATR, the stop is pushed out and the size is recalculated. If the order is still rejected for stops (`10016`), the bot fills without stops and attaches them immediately after.
+- **Requotes.** Price-changed / requote / off-quotes are retried with a fresh tick, up to 4 times on that bar. The bar is not marked done until the order is filled or permanently rejected.
+- **Closes.** Every poll, an open position is closed at market when the stop or target is touched. A missing stop is put back on the position, including after a restart (`runtime_state.json`). A broker stop can still close it; a second close is treated as already done.
+- **Naked tickets.** A position with no stop gets an ATR stop attached so it cannot sit unprotected.
+
+`LIVE_TRADING=false` still sends nothing. In that mode the bot tracks the would-be position and logs the close when the level is hit, so you can see both sides before going live.
 
 ---
 
 ## Requirements
 
-1. **Windows machine or Windows VPS** (MetaTrader 5 Python package is officially Windows-only).
-   - Oracle Cloud free tier → create a Windows Server instance (or use a cheap Windows VPS from Contabo / ForexVPS / etc.).
-   - Linux users: possible via Wine + MT5, but not officially supported and more fragile.
-2. MetaTrader 5 terminal installed and logged into a **demo** account first.
-3. Python 3.10+ 
+1. **Windows machine or Windows VPS** (the MetaTrader 5 Python package is officially Windows-only).
+2. MetaTrader 5 installed and logged into a **demo** account first. Gold (`XAUUSD` or your broker's name) must be available.
+3. Python 3.10+
 
 ---
 
 ## Quick start (demo)
 
 ```bash
-# 1. Clone / copy this folder to the machine that has MT5 installed
 cd mt5-ema-reclaim-bot
-
-# 2. Create virtual environment
 python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # Linux (if using Wine setup)
-
-# 3. Install dependencies
+.venv\Scripts\activate
 pip install -r requirements.txt
-
-# 4. Configure
 copy .env.example .env
-# Edit .env with your demo login, password, server, symbol, etc.
-# Keep LIVE_TRADING=false
+```
 
-# 5. Make sure MT5 terminal is running and logged in
+Edit `.env`: demo login, password, server, and `SYMBOL` if your broker names gold something other than `XAUUSD`. Leave `LIVE_TRADING=false`.
 
-# 6. Start the bot
+Start the terminal, log in, then:
+
+```bash
 python bot.py
 ```
 
-You should see logs like:
+Check the decision logic without MT5:
 
+```bash
+python test_trade_logic.py
+python test_strategy.py
 ```
-2026-10-20 20:45:01 | INFO    | Connected | Balance=10000.00 Equity=10000.00 | Server=YourBroker-Demo | Trade mode=DEMO
-2026-10-20 20:45:05 | INFO    | Bot running. Waiting for new closed bars…
-2026-10-20 20:50:01 | INFO    | Bar 2026-10-20 20:45 | action=NO_TRADE | … Waiting for a close back through the fast average.
-```
-
-When a real signal appears and `LIVE_TRADING=false`, the bot logs the would-be order but does **not** send it.
 
 ---
 
-## Going live (real account)
+## Going live
 
-1. Run on demo for at least several weeks / hundreds of bars.
-2. Verify the logs match what you expect.
-3. Switch the MT5 terminal to your **real** account (or change credentials in `.env`).
-4. Set `LIVE_TRADING=true` in `.env`.
-5. Restart the bot.
-6. Monitor closely the first few days.
+1. Run on demo until the logged opens and closes match the levels you expect.
+2. Confirm the symbol in the log is your gold symbol, not a fallback you didn't want.
+3. Set `LIVE_TRADING=true`.
+4. Restart the bot and watch the first fills.
 
-**You are fully responsible for any losses.** This is educational/production-ready scaffolding, not financial advice.
+**You are fully responsible for any losses.** This is not financial advice.
 
 ---
 
-## Hosting options (always-on)
-
-| Provider | Notes |
-|----------|-------|
-| **Oracle Cloud Free Tier** | Can create a Windows Server VM (limited). Good free option if you can get capacity. |
-| **Contabo / Hetzner / DigitalOcean** | Cheap Windows or Linux VPS (~$5–12/mo). |
-| **Specialized Forex VPS** | ForexVPS, Beeks, etc. — already optimised for MT5 latency. |
-| Railway / Render / Netlify | **Not suitable** — they sleep or are not designed for persistent MT5 connections. |
-
-Recommended minimal setup:
-- Windows Server VPS
-- MT5 terminal installed + auto-login
-- This Python bot running as a Windows Service or under `nssm` / Task Scheduler so it restarts on reboot
-
----
-
-## Phone monitoring
-
-- Install the official **MetaTrader 5** mobile app (iOS/Android).
-- Log into the same account.
-- You can see open positions, history, and even close trades manually from the phone.
-- The bot itself must keep running on the VPS/PC; the phone is for monitoring and emergency intervention only.
-
----
-
-## Configuration reference (`.env`)
+## Configuration
 
 | Variable | Default | Meaning |
 |----------|---------|---------|
-| `MT5_LOGIN` / `PASSWORD` / `SERVER` | — | Account credentials |
-| `SYMBOL` | EURUSD | Instrument |
-| `TIMEFRAME` | M15 | Bar size |
-| `RISK_FRACTION` | 0.0025 | 0.25 % equity risk per trade |
-| `DAILY_LOSS_FRACTION` | 0.01 | 1 % daily loss circuit-breaker |
-| `MAX_DRAWDOWN_FRACTION` | 0.03 | 3 % from peak |
-| `MAX_POSITIONS` | 1 | Concurrent trades |
-| `MAX_SPREAD_PIPS` | 2.0 | Spread filter |
+| `SYMBOL` | XAUUSD | Gold symbol. Suffixes are tried if this exact name is missing |
+| `TIMEFRAME` | M15 | Bar size. Entries only on close |
+| `RISK_FRACTION` | 0.0025 | Equity risk per trade |
+| `DAILY_LOSS_FRACTION` | 0.01 | Blocks new entries after a 1% down day |
+| `MAX_DRAWDOWN_FRACTION` | 0.03 | Blocks new entries 3% off the peak |
+| `MAX_POSITIONS` | 1 | One gold position at a time |
+| `MAX_SPREAD_PIPS` | 50 | Gold spread filter. Do not set this to 2 |
 | `STOP_MULTIPLE` / `TAKE_MULTIPLE` | 1.5 / 2.2 | ATR multiples |
-| `MAGIC` | 20251020 | Identifies the bot’s trades |
-| `LIVE_TRADING` | false | **Must be true to send real orders** |
-| `POLL_SECONDS` | 5 | How often to check for a new bar |
+| `MAGIC` | 20251020 | Only these tickets are managed |
+| `LIVE_TRADING` | false | Must be true to send orders |
+| `POLL_SECONDS` | 1 | Exit check interval |
+
+Day-start equity, peak equity, and intended stops are stored in `runtime_state.json` next to the bot (not committed).
 
 ---
 
-## Safety features built in
+## Hosting
 
-- Magic-number isolation (only manages its own trades)
-- Spread filter
-- Daily loss limit
-- Max drawdown limit
-- Position count limit
-- Volume calculated from risk % (never fixed lots)
-- Dry-run mode when `LIVE_TRADING=false`
-- Clear logging of every decision
-
----
-
-## Next improvements you may want
-
-- Persist day-start equity and peak equity to a small SQLite file
-- Telegram / Discord notifications on entries & exits
-- Multi-symbol support
-- Proper Windows service wrapper
-- Back-test harness using the same `strategy.py` on historical data
+Run it on a Windows VPS beside a logged-in MT5 terminal (Task Scheduler or NSSM so it restarts on reboot). The phone app is only for watching the same account. Railway / Render / Netlify cannot host this.
 
 ---
 
 ## Disclaimer
 
-Trading forex and CFDs involves substantial risk of loss. Past performance of a strategy (even a carefully ported one) does not guarantee future results. Always test thoroughly on a demo account before risking real capital. You alone are responsible for the configuration and the capital you put at risk.
+Trading CFDs and gold involves substantial risk of loss. Test on a demo account before using real capital. You alone are responsible for the configuration and the money at risk.
